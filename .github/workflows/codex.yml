@@ -1,0 +1,262 @@
+name: Codex (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      container_image: { type: string, default: mcr.microsoft.com/devcontainers/universal:2-linux, required: false }
+      lifecycle_scripts:
+        type: string
+        required: false
+        default: |
+          .devcontainer/post-create.sh
+          .devcontainer/post-start.sh
+      model:            { type: string, default: gpt5-codex-medium, required: false }
+      thinking_budget:  { type: string, default: medium, required: false }
+      resume:           { type: string, default: none, required: false }   # none|chat|full
+      artifact_retention_days: { type: number, default: 90, required: false }
+      danger_mode:      { type: boolean, default: true, required: false }
+      ready_on_success: { type: boolean, default: false, required: false }
+    secrets:
+      CODEX_APP_ID:         { required: true }
+      CODEX_APP_PRIVATE_KEY:{ required: true }
+      CODEX_AUTH_JSON_B64:  { required: true }
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  codex:
+    name: Codex/Agent
+    runs-on: ubuntu-latest
+    container: { image: ${{ inputs.container_image }} }
+    env:
+      GH_TOKEN: ""
+      RETENTION_DAYS: ${{ inputs.artifact_retention_days }}
+      RESUME_MODE: ${{ inputs.resume }}
+      THINK_BUDGET: ${{ inputs.thinking_budget }}
+      MODEL_LABEL:  ${{ inputs.model }}
+      DANGER:       ${{ inputs.danger_mode }}
+    steps:
+      - id: app
+        name: Mint GitHub App token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.CODEX_APP_ID }}
+          private-key: ${{ secrets.CODEX_APP_PRIVATE_KEY }}
+
+      - name: Export GH_TOKEN
+        run: echo "GH_TOKEN=${{ steps.app.outputs.token }}" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0, token: ${{ steps.app.outputs.token }} }
+
+      - id: ctx
+        name: Determine trigger context
+        shell: bash
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          if [[ "${{ github.event_name }}" == "issue_comment" ]]; then
+            BODY='${{ github.event.comment.body }}'
+            TASK="$(echo "$BODY" | sed -E 's/^[[:space:]]*@codex[[:space:]]*//')"
+            echo "task=$TASK" >> $GITHUB_OUTPUT
+            echo "comment_id=${{ github.event.comment.id }}" >> $GITHUB_OUTPUT
+            if [[ "${{ toJson(github.event.issue.pull_request) }}" != "null" ]]; then
+              PR_URL='${{ github.event.issue.pull_request.url }}'
+              pr_json="$(gh api "$PR_URL")"
+              echo "is_pr=yes" >> $GITHUB_OUTPUT
+              echo "pr_number=$(echo "$pr_json" | jq -r '.number')" >> $GITHUB_OUTPUT
+              echo "head_ref=$(echo "$pr_json" | jq -r '.head.ref')" >> $GITHUB_OUTPUT
+              echo "base_ref=$(echo "$pr_json" | jq -r '.base.ref')" >> $GITHUB_OUTPUT
+            else
+              echo "is_pr=no" >> $GITHUB_OUTPUT
+              echo "base_ref=${{ github.event.repository.default_branch }}" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "is_pr=no" >> $GITHUB_OUTPUT
+            echo "task=${{ github.event.inputs.task || 'No task provided' }}" >> $GITHUB_OUTPUT
+            echo "base_ref=${{ github.event.repository.default_branch }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Label: codex:queued (PR)
+        if: ${{ steps.ctx.outputs.is_pr == 'yes' }}
+        run: gh issue edit ${{ steps.ctx.outputs.pr_number }} --add-label "codex:queued"
+
+      - name: React 👀 (optional)
+        if: ${{ github.event_name == 'issue_comment' }}
+        run: |
+          gh api repos/${{ steps.ctx.outputs.repo }}/issues/comments/${{ steps.ctx.outputs.comment_id }}/reactions \
+            -H "Accept: application/vnd.github+json" -f content=eyes
+
+      - id: br
+        name: Prepare branch (PR or Issue)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ steps.ctx.outputs.is_pr }}" == "yes" ]]; then
+            git fetch origin "${{ steps.ctx.outputs.head_ref }}"
+            git checkout -B "${{ steps.ctx.outputs.head_ref }}" "origin/${{ steps.ctx.outputs.head_ref }}"
+            echo "branch=${{ steps.ctx.outputs.head_ref }}" >> $GITHUB_OUTPUT
+            echo "pr=${{ steps.ctx.outputs.pr_number }}" >> $GITHUB_OUTPUT
+          else
+            git fetch origin "${{ steps.ctx.outputs.base_ref }}"
+            SLUG="$(echo "${{ steps.ctx.outputs.task }}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9- ' | tr ' ' '-' | cut -c1-40)"
+            BR="codex/${SLUG:-task}-${GITHUB_RUN_ID}"
+            git checkout -B "$BR" "origin/${{ steps.ctx.outputs.base_ref }}"
+            gh pr create --draft -B "${{ steps.ctx.outputs.base_ref }}" -H "$BR" \
+              --title "codex: ${{ steps.ctx.outputs.task }}" \
+              --body "Spawned by codex. Progress tracked here."
+            PRN="$(gh pr view --json number -q .number)"
+            echo "branch=$BR" >> $GITHUB_OUTPUT
+            echo "pr=$PRN" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Label swap → provisioning
+        if: ${{ steps.ctx.outputs.is_pr == 'yes' }}
+        run: gh issue edit ${{ steps.ctx.outputs.pr_number }} --remove-label "codex:queued" --add-label "codex:provisioning"
+
+      - id: checks
+        name: Create Check Run (in_progress)
+        shell: bash
+        run: |
+          SHA="$(git rev-parse HEAD)"
+          RESP="$(gh api -X POST repos/${{ steps.ctx.outputs.repo }}/check-runs \
+            -H "Accept: application/vnd.github+json" \
+            -f name="Codex/Agent" -f head_sha="$SHA" -f status="in_progress")"
+          echo "check_id=$(echo "$RESP" | jq -r '.id')" >> $GITHUB_OUTPUT
+
+      - name: Run lifecycle scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=$'\n'
+          for s in ${{ inputs.lifecycle_scripts }}; do
+            if [[ -n "$s" && -x "$s" ]]; then echo "Running $s"; "$s"; fi
+          done
+
+      - name: Restore Codex OAuth (ChatGPT plan)
+        run: |
+          mkdir -p "$HOME/.codex"
+          echo "${{ secrets.CODEX_AUTH_JSON_B64 }}" | base64 -d > "$HOME/.codex/auth.json"
+          printf 'preferred_auth_method = "chatgpt"\n' >> "$HOME/.codex/config.toml"
+
+      - name: Install Codex CLI
+        run: |
+          npm i -g @openai/codex
+          codex --version || true
+
+      - name: Maybe resume (download latest artifacts for this PR)
+        if: ${{ inputs.resume != 'none' }}
+        env: { BRANCH: ${{ steps.br.outputs.branch }} }
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUN_ID="$(gh run list -w "${{ github.workflow }}" -b "$BRANCH" -s completed -L 20 --json databaseId,headBranch \
+            --jq 'map(select(.headBranch=="'"$BRANCH"'")) | .[0].databaseId' || true)"
+          if [[ -n "$RUN_ID" && "$RUN_ID" != "null" ]]; then
+            gh run download "$RUN_ID" || true
+            if [[ "${{ inputs.resume }}" == "full" ]]; then
+              tar -I zstd -xf overlay.tar.zst 2>/dev/null || tar -I zstd -xf artifacts/overlay.tar.zst || true
+              git apply --index workspace.patch 2>/dev/null || git apply --index artifacts/workspace.patch || true
+            fi
+          fi
+
+      - name: Label swap → running
+        if: ${{ steps.ctx.outputs.is_pr == 'yes' }}
+        run: gh issue edit ${{ steps.ctx.outputs.pr_number }} --remove-label "codex:provisioning" --add-label "codex:running"
+
+      - id: msg
+        name: Compose message
+        shell: bash
+        run: |
+          PRN="${{ steps.br.outputs.pr }}"
+          if [[ -n "$PRN" ]]; then
+            PRJSON="$(gh pr view "$PRN" --json number,title,body,headRefName,baseRefName)"
+            TITLE=$(echo "$PRJSON" | jq -r .title)
+            BODY=$(echo "$PRJSON" | jq -r .body)
+            echo "full=Task: ${{ steps.ctx.outputs.task }} | PR #$PRN ($TITLE). Notes: $BODY. Model: ${{ inputs.model }}; Budget: ${{ inputs.thinking_budget }}." >> $GITHUB_OUTPUT
+          else
+            echo "full=Task: ${{ steps.ctx.outputs.task }} | Branch: ${{ steps.br.outputs.branch }}. Model: ${{ inputs.model }}; Budget: ${{ inputs.thinking_budget }}." >> $GITHUB_OUTPUT
+          fi
+
+      - id: run
+        name: Run Codex (non-interactive)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.danger_mode }}" == 'true' ]]; then
+            codex --yolo exec "${{ steps.msg.outputs.full }}" > Final-Message.md 2>&1 || true
+          else
+            codex exec "${{ steps.msg.outputs.full }}" > Final-Message.md 2>&1 || true
+          fi
+
+      - id: push
+        name: Fallback: commit/push/PR if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "codex-github-app[bot]"
+          git config user.email "codex-github-app[bot]@users.noreply.github.com"
+          CHANGED=0
+          if ! git diff --quiet; then
+            CHANGED=1
+            git add -A
+            git commit -m "codex: ${{ steps.ctx.outputs.task }} [run ${GITHUB_RUN_ID}]"
+            git push origin HEAD
+          fi
+          if [[ "${{ inputs.ready_on_success }}" == 'true' && "$CHANGED" -eq 1 ]]; then
+            gh pr ready || true
+          fi
+          echo "changed=$CHANGED" >> $GITHUB_OUTPUT
+
+      - name: Collect traces (+ overlay if any)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          find "$HOME/.codex" -type f -name 'rollout-*.jsonl' -printf '%T@ %p\n' \
+            | sort -nr | head -n 10 | awk '{print $2}' | xargs -I{} cat "{}" > artifacts/trace.jsonl || true
+          cp -f Final-Message.md artifacts/ || true
+          if ! git diff --quiet; then
+            git diff --binary > artifacts/workspace.patch || true
+            git ls-files --others --exclude-standard -z \
+              | tar --zstd -cf artifacts/overlay.tar.zst --no-recursion --null -T - || true
+          fi
+
+      - name: Upload artifacts (90d)
+        uses: actions/upload-artifact@v4
+        with:
+          name: codex-pr${{ steps.br.outputs.pr || 'none' }}-run${{ github.run_id }}
+          path: artifacts/
+          retention-days: ${{ env.RETENTION_DAYS }}
+
+      - name: Finalize Check Run
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONC="success"
+          if [[ "${{ job.status }}" != "success" ]]; then CONC="failure"; fi
+          gh api -X PATCH repos/${{ steps.ctx.outputs.repo }}/check-runs/${{ steps.checks.outputs.check_id }} \
+            -H "Accept: application/vnd.github+json" \
+            -f status="completed" -f conclusion="$CONC" \
+            -f completed_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+      - name: Label: done/failed
+        if: ${{ steps.ctx.outputs.is_pr == 'yes' && always() }}
+        shell: bash
+        run: |
+          if [[ "${{ job.status }}" == "success" ]]; then
+            gh issue edit ${{ steps.ctx.outputs.pr_number }} --remove-label "codex:running" --add-label "codex:done"
+          else
+            gh issue edit ${{ steps.ctx.outputs.pr_number }} --remove-label "codex:running" --add-label "codex:failed"
+          fi
+
+      - name: React 🎉/👎 (optional)
+        if: ${{ github.event_name == 'issue_comment' && always() }}
+        run: |
+          EMOJI="hooray"; [[ "${{ job.status }}" == "success" ]] || EMOJI="-1"
+          gh api repos/${{ steps.ctx.outputs.repo }}/issues/comments/${{ steps.ctx.outputs.comment_id }}/reactions \
+            -H "Accept: application/vnd.github+json" -f content="$EMOJI"
